@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "cnmt.h"
+#include "nca.h"
 #include "nsp.h"
 #include "pfs0.h"
 #include "types.h"
@@ -35,6 +36,11 @@ static void build_nsp_filename(char *output, size_t output_size, const char *dir
                                 const char *title, const char *title_id, const char *suffix,
                                 const char *ext);
 static int move_file_robust(const char *old_path, const char *new_path);
+static int process_nsp_rename(const char *nsp_path, nxci_ctx_t *tool_ctx);
+static int read_cnmt_from_nca_in_nsp(FILE *nsp_file, uint64_t nca_offset, uint64_t nca_size,
+                                      nxci_ctx_t *tool_ctx,
+                                      uint64_t *out_title_id, uint32_t *out_version,
+                                      char *out_type, size_t type_size);
 
 #define TITLEDB_FILENAME  "US.en.json"
 #define TITLEDB_URL       "https://raw.githubusercontent.com/blawar/titledb/master/US.en.json"
@@ -185,8 +191,154 @@ typedef struct {
     int type; // 0=application, 1=patch, 2=addon
 } process_task_t;
 
+// Helper to extract and decrypt the binary CNMT from a .cnmt.nca embedded in an NSP.
+// Writes the extracted NCA to a temp file, decrypts it using the keyset in tool_ctx,
+// reads the CNMT binary header, and fills the output parameters.
+// Returns 1 on success, 0 on failure.
+static int read_cnmt_from_nca_in_nsp(FILE *nsp_file, uint64_t nca_offset, uint64_t nca_size,
+                                      nxci_ctx_t *tool_ctx,
+                                      uint64_t *out_title_id, uint32_t *out_version,
+                                      char *out_type, size_t type_size)
+{
+    const char *tmp_path = "4nxci_cnmt_tmp.nca";
+
+    // Extract the .cnmt.nca bytes to a temporary file
+    FILE *tmp = fopen(tmp_path, "wb");
+    if (!tmp)
+    {
+        fprintf(stderr, "Warning: Failed to create temp file for NCA extraction\n");
+        return 0;
+    }
+
+    fseeko64(nsp_file, (int64_t)nca_offset, SEEK_SET);
+
+    char buf[65536];
+    uint64_t remaining = nca_size;
+    while (remaining > 0)
+    {
+        size_t chunk = (remaining > sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
+        size_t rd = fread(buf, 1, chunk, nsp_file);
+        if (rd == 0)
+        {
+            break;
+        }
+        fwrite(buf, 1, rd, tmp);
+        remaining -= rd;
+    }
+    fclose(tmp);
+
+    if (remaining != 0)
+    {
+        fprintf(stderr, "Warning: Failed to extract NCA from NSP (incomplete read)\n");
+        remove(tmp_path);
+        return 0;
+    }
+
+    // Open the extracted NCA file and decrypt the CNMT
+    FILE *nca_file = fopen(tmp_path, "rb");
+    if (!nca_file)
+    {
+        remove(tmp_path);
+        return 0;
+    }
+
+    nca_ctx_t nca_ctx;
+    nca_init(&nca_ctx);
+    nca_ctx.file = nca_file;
+    nca_ctx.tool_ctx = tool_ctx;
+
+    if (!nca_decrypt_header(&nca_ctx))
+    {
+        fprintf(stderr, "Warning: Failed to decrypt NCA header (are keys correct?)\n");
+        fclose(nca_file);
+        remove(tmp_path);
+        return 0;
+    }
+
+    // Determine crypto generation
+    nca_ctx.crypto_type = nca_ctx.header.crypto_type;
+    if (nca_ctx.header.crypto_type2 > nca_ctx.header.crypto_type)
+    {
+        nca_ctx.crypto_type = nca_ctx.header.crypto_type2;
+    }
+    if (nca_ctx.crypto_type)
+    {
+        nca_ctx.crypto_type--;
+    }
+
+    nca_decrypt_key_area(&nca_ctx);
+
+    // Set up AES-CTR context for section 0 (the PFS0 holding the CNMT binary)
+    nca_ctx.section_contexts[0].aes = new_aes_ctx(nca_ctx.decrypted_keys[2], 16, AES_MODE_CTR);
+    nca_ctx.section_contexts[0].offset = media_to_real(nca_ctx.header.section_entries[0].media_start_offset);
+    nca_ctx.section_contexts[0].sector_ofs = 0;
+    nca_ctx.section_contexts[0].file = nca_file;
+    nca_ctx.section_contexts[0].crypt_type = CRYPT_CTR;
+    nca_ctx.section_contexts[0].header = &nca_ctx.header.fs_headers[0];
+
+    uint64_t ctr_ofs = nca_ctx.section_contexts[0].offset >> 4;
+    for (unsigned int j = 0; j < 0x8; j++)
+    {
+        nca_ctx.section_contexts[0].ctr[j] = nca_ctx.section_contexts[0].header->section_ctr[0x8 - j - 1];
+        nca_ctx.section_contexts[0].ctr[0x10 - j - 1] = (unsigned char)(ctr_ofs & 0xFF);
+        ctr_ofs >>= 8;
+    }
+
+    // Read the PFS0 header that wraps the CNMT binary inside section 0
+    pfs0_header_t pfs0_header;
+    uint64_t pfs0_offset = nca_ctx.header.fs_headers[0].pfs0_superblock.pfs0_offset;
+    nca_section_fseek(&nca_ctx.section_contexts[0], pfs0_offset);
+    nca_section_fread(&nca_ctx.section_contexts[0], &pfs0_header, sizeof(pfs0_header_t));
+
+    int success = 0;
+
+    if (pfs0_header.magic == MAGIC_PFS0 && pfs0_header.num_files > 0)
+    {
+        // CNMT binary immediately follows the PFS0 header, file-entry table, and string table
+        uint64_t cnmt_data_offset = pfs0_offset
+            + sizeof(pfs0_header_t)
+            + ((uint64_t)pfs0_header.num_files * sizeof(pfs0_file_entry_t))
+            + pfs0_header.string_table_size;
+
+        cnmt_header_t cnmt_header;
+        nca_section_fseek(&nca_ctx.section_contexts[0], cnmt_data_offset);
+        nca_section_fread(&nca_ctx.section_contexts[0], &cnmt_header, sizeof(cnmt_header_t));
+
+        *out_title_id = cnmt_header.title_id;
+        *out_version  = cnmt_header.title_version;
+
+        switch (cnmt_header.type)
+        {
+        case 0x80:
+            strncpy(out_type, "Application", type_size - 1);
+            break;
+        case 0x81:
+            strncpy(out_type, "Patch", type_size - 1);
+            break;
+        case 0x82:
+            strncpy(out_type, "AddOnContent", type_size - 1);
+            break;
+        default:
+            snprintf(out_type, type_size, "Unknown(0x%02X)", cnmt_header.type);
+            break;
+        }
+        out_type[type_size - 1] = '\0';
+
+        success = (*out_title_id != 0);
+    }
+    else
+    {
+        fprintf(stderr, "Warning: PFS0 magic not found inside .cnmt.nca section\n");
+    }
+
+    free_aes_ctx(nca_ctx.section_contexts[0].aes);
+    fclose(nca_file);
+    remove(tmp_path);
+    return success;
+}
+
 // Function to read and rename an NSP file based on its metadata
-static int process_nsp_rename(const char *nsp_path)
+static int process_nsp_rename(const char *nsp_path, nxci_ctx_t *tool_ctx)
 {
     printf("===> Processing NSP/NSZ file for renaming: %s\n", nsp_path);
 
@@ -245,8 +397,11 @@ static int process_nsp_rename(const char *nsp_path)
     char *cnmt_filename = NULL;
     uint64_t cnmt_xml_offset = 0;
     uint64_t cnmt_xml_size   = 0;
+    uint64_t cnmt_nca_offset = 0;
+    uint64_t cnmt_nca_size   = 0;
     uint64_t ticket_offset   = 0;
     int has_cnmt_xml = 0;
+    int has_cnmt_nca = 0;
     int has_ticket   = 0;
 
     for (uint32_t i = 0; i < header.num_files; i++)
@@ -265,7 +420,10 @@ static int process_nsp_rename(const char *nsp_path)
         // .cnmt.nca — encrypted metadata NCA (kept for completeness)
         if (strstr(filename, ".cnmt.nca") != NULL)
         {
-            cnmt_filename = filename;
+            cnmt_filename    = filename;
+            has_cnmt_nca     = 1;
+            cnmt_nca_offset  = data_base + entries[i].offset;
+            cnmt_nca_size    = entries[i].size;
             printf("Found CNMT NCA: %s\n", filename);
         }
 
@@ -278,7 +436,7 @@ static int process_nsp_rename(const char *nsp_path)
         }
     }
 
-    if (!cnmt_filename && !has_cnmt_xml)
+    if (!cnmt_filename && !has_cnmt_xml && !has_cnmt_nca)
     {
         fprintf(stderr, "Error: No CNMT file found in NSP\n");
         free(entries);
@@ -384,8 +542,26 @@ static int process_nsp_rename(const char *nsp_path)
 
     if (title_id == 0)
     {
+        // Third fallback: decrypt binary CNMT from the .cnmt.nca using the keyset
+        if (has_cnmt_nca && tool_ctx != NULL)
+        {
+            printf("Attempting to read Title ID from binary CNMT (NCA decryption)...\n");
+            if (read_cnmt_from_nca_in_nsp(nsp_file, cnmt_nca_offset, cnmt_nca_size,
+                                          tool_ctx, &title_id, &cnmt_version,
+                                          cnmt_type, sizeof(cnmt_type)))
+            {
+                snprintf(title_id_str, sizeof(title_id_str), "%016llX",
+                         (unsigned long long)title_id);
+                printf("Extracted Title ID from binary CNMT: %s\n", title_id_str);
+                printf("Type from binary CNMT: %s\n", cnmt_type);
+            }
+        }
+    }
+
+    if (title_id == 0)
+    {
         fprintf(stderr, "Error: Could not extract title ID from NSP metadata\n");
-        fprintf(stderr, "       (no .cnmt.xml found and no ticket present)\n");
+        fprintf(stderr, "       (no .cnmt.xml, no ticket, and NCA decryption failed or unavailable)\n");
         free(entries);
         free(string_table);
         fclose(nsp_file);
@@ -657,6 +833,7 @@ int main(int argc, char **argv)
 {
     nxci_ctx_t tool_ctx;
     char input_name[0x200];
+    char rename_target[MAX_PATH] = {0};
 
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
@@ -718,8 +895,10 @@ int main(int argc, char **argv)
             tool_ctx.settings.deletexci = 1;
             break;
         case 'r':
-            // NSP rename mode - process and exit
-            return process_nsp_rename(optarg);
+            // Save rename path; the function is called after keys are loaded
+            strncpy(rename_target, optarg, MAX_PATH - 1);
+            rename_target[MAX_PATH - 1] = '\0';
+            break;
         case 't':
             filepath_set(&tool_ctx.settings.secure_dir_path, optarg);
             break;
@@ -766,9 +945,19 @@ int main(int argc, char **argv)
         extkeys_initialize_keyset(&tool_ctx.settings.keyset, keyfile);
         pki_derive_keys(&tool_ctx.settings.keyset);
         fclose(keyfile);
+
+        if (rename_target[0] != '\0')
+            return process_nsp_rename(rename_target, &tool_ctx);
     }
     else
     {
+        if (rename_target[0] != '\0')
+        {
+            // No keyset found - NCA decryption will not be available, but
+            // the .cnmt.xml and ticket fallbacks can still work without keys.
+            printf("\nWarning: No keyset found - NCA decryption unavailable for rename\n");
+            return process_nsp_rename(rename_target, &tool_ctx);
+        }
         printf("\n");
         fprintf(stderr, "Error: Unable to open keyset file\n"
                         "Use -k or --keyset to specify your keyset file path or place your keyset in ." OS_PATH_SEPARATOR "keys.dat\n");
