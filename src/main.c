@@ -31,8 +31,9 @@
 // Forward declarations
 static void ensure_titledb(void);
 static void sanitize_filename(char *name);
-static void build_nsp_filename(char *output, size_t output_size, const char *dir_path, 
-                                const char *title, const char *title_id, const char *suffix);
+static void build_nsp_filename(char *output, size_t output_size, const char *dir_path,
+                                const char *title, const char *title_id, const char *suffix,
+                                const char *ext);
 static int move_file_robust(const char *old_path, const char *new_path);
 
 #define TITLEDB_FILENAME  "US.en.json"
@@ -187,7 +188,7 @@ typedef struct {
 // Function to read and rename an NSP file based on its metadata
 static int process_nsp_rename(const char *nsp_path)
 {
-    printf("===> Processing NSP file for renaming: %s\n", nsp_path);
+    printf("===> Processing NSP/NSZ file for renaming: %s\n", nsp_path);
 
     FILE *nsp_file = fopen(nsp_path, "rb");
     if (!nsp_file)
@@ -472,7 +473,15 @@ static int process_nsp_rename(const char *nsp_path)
         dir_path[dir_len] = '\0';
     }
 
-    build_nsp_filename(new_path, MAX_PATH, dir_path, title_name, title_id_str, suffix);
+    // Preserve input extension (.nsp or .nsz) in the output filename
+    const char *input_ext = ".nsp";
+    const char *ext_dot = strrchr(nsp_path, '.');
+    if (ext_dot != NULL && (strcmp(ext_dot, ".nsz") == 0 || strcmp(ext_dot, ".NSZ") == 0))
+    {
+        input_ext = ".nsz";
+    }
+
+    build_nsp_filename(new_path, MAX_PATH, dir_path, title_name, title_id_str, suffix, input_ext);
 
     printf("\nRenaming:\n");
     printf("  From: %s\n", nsp_path);
@@ -498,7 +507,7 @@ static int process_nsp_rename(const char *nsp_path)
 
         if (MoveFileExW(old_path_w, new_path_w, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
         {
-            printf("Successfully renamed NSP file!\n");
+            printf("Successfully renamed NSP/NSZ file!\n");
             return EXIT_SUCCESS;
         }
         fprintf(stderr, "Error: Failed to rename NSP file (error: %lu)\n", GetLastError());
@@ -507,7 +516,7 @@ static int process_nsp_rename(const char *nsp_path)
 #else
     if (move_file_robust(nsp_path, new_path) == 0)
     {
-        printf("Successfully renamed NSP file!\n");
+        printf("Successfully renamed NSP/NSZ file!\n");
         return EXIT_SUCCESS;
     }
     fprintf(stderr, "Error: Failed to rename NSP file (errno: %d - %s)\n",
@@ -601,12 +610,12 @@ static void sanitize_filename(char *name)
 }
 
 // Helper function to build new filename with title prefix and suffix
-static void build_nsp_filename(char *output, size_t output_size, const char *dir_path, 
-                                const char *title, const char *title_id, const char *suffix)
+static void build_nsp_filename(char *output, size_t output_size, const char *dir_path,
+                                const char *title, const char *title_id, const char *suffix,
+                                const char *ext)
 {
-    // Build: dir_path + title + "[" + title_id + "]" + suffix + ".nsp"
-    snprintf(output, output_size, "%s%s[%s]%s.nsp", 
-             dir_path ? dir_path : "", title, title_id, suffix);
+    snprintf(output, output_size, "%s%s[%s]%s%s",
+             dir_path ? dir_path : "", title, title_id, suffix, ext);
 }
 
 // Helper function to decode Nintendo Switch version number
@@ -630,7 +639,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "Usage: %s [options...] <path_to_file.xci>\n"
-            "       %s -r <path_to_file.nsp>\n\n"
+            "       %s -r <path_to_file.nsp|.nsz>\n\n"
             "Options:\n"
             "-k, --keyset             Set keyset filepath, default filepath is ." OS_PATH_SEPARATOR "keys.dat\n"
             "-h, --help               Display usage\n"
@@ -638,7 +647,7 @@ static void usage(void)
             "-o, --outdir             Set output directory path\n"
             "-c, --convert            Use Titlename instead of Titleid in nsp name\n"
             "-d, --delete             Delete source XCI file after successful conversion\n"
-            "-r, --rename             Rename NSP file to match naming format\n"
+            "-r, --rename             Rename NSP/NSZ file to match naming format\n"
             "--keepncaid              Keep current ncas ids\n",
             USAGE_PROGRAM_NAME, USAGE_PROGRAM_NAME);
     exit(EXIT_FAILURE);
@@ -1004,7 +1013,7 @@ int main(int argc, char **argv)
         }
 
         // Build new filename
-        build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[i].title_name, title_id, "[BASE]");
+        build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[i].title_name, title_id, "[BASE]", ".nsp");
 
         printf("Renaming: %s\n       -> %s\n", old_path, new_path);
 
@@ -1072,7 +1081,7 @@ int main(int argc, char **argv)
                 strcpy(suffix, "[UPD]");
             }
 
-            build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[0].title_name, title_id, suffix);
+            build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[0].title_name, title_id, suffix, ".nsp");
 
             printf("Renaming: %s\n       -> %s\n", old_path, new_path);
 
@@ -1114,7 +1123,7 @@ int main(int argc, char **argv)
                 dir_path[dir_len] = '\0';
             }
 
-            build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[0].title_name, title_id, "[DLC]");
+            build_nsp_filename(new_path, MAX_PATH, dir_path, application_nsps[0].title_name, title_id, "[DLC]", ".nsp");
 
             printf("Renaming: %s\n       -> %s\n", old_path, new_path);
 

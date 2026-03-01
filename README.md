@@ -46,11 +46,12 @@ Add `-d` to delete the source XCI file after conversion:
 .\4nxci.exe -c -d <path_to_file.xci>
 ```
 
-**Rename existing NSP files:**
+**Rename existing NSP/NSZ files:**
 ```
 .\4nxci.exe -r <path_to_file.nsp>
+.\4nxci.exe -r <path_to_file.nsz>
 ```
-This will rename the NSP file to match the naming format based on its internal metadata (Title ID, version, type).
+This will rename the NSP or NSZ file to match the naming format based on its internal metadata (Title ID, version, type). The original extension is preserved in the output filename.
 
 **Title name database:**
 
